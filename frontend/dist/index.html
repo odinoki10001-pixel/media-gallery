@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Галерея</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="aurora"></div>
+
+<aside class="sidebar glass">
+  <div class="sb-title">Библиотека</div>
+  <button class="sb-item active" data-view="all"><span class="ico">🗂</span>Все медиа</button>
+  <button class="sb-item" data-view="fav"><span class="ico">❤</span>Избранное<span class="cnt" id="favCnt"></span></button>
+  <button class="sb-item" data-view="top"><span class="ico">★</span>Лучшие (4+)</button>
+  <button class="sb-item" data-view="safe"><span class="ico">🔒</span>Сейф</button>
+  <button class="sb-item danger" id="btnDeleteSafe" hidden><span class="ico">🗑</span>Удалить сейф</button>
+
+  <div class="sb-title">Альбомы</div>
+  <div id="albumList" class="album-list"></div>
+  <button class="sb-add" id="btnAddAlbum">+ Альбом</button>
+
+  <div class="sb-title">Умные альбомы</div>
+  <div id="smartList" class="album-list"></div>
+  <button class="sb-add" id="btnAddSmart">+ Умный</button>
+
+  <div class="scan-status" id="scanStatus"></div>
+</aside>
+
+<div class="content">
+  <header class="topbar glass">
+    <label class="search">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+      </svg>
+      <input id="q" placeholder="Поиск по имени, пути, содержимому (OCR)…" autocomplete="off">
+    </label>
+    <div class="seg" id="seg">
+      <button data-type="" class="active">Все</button>
+      <button data-type="image">Фото</button>
+      <button data-type="video">Видео</button>
+    </div>
+    <span id="count" class="count"></span>
+  </header>
+
+  <main id="main" class="main">
+    <div id="sections" class="sections"></div>
+    <div id="gridFlat" class="grid" hidden></div>
+    <div id="empty" class="empty" hidden></div>
+    <div id="sentinel" class="sentinel"></div>
+  </main>
+
+  <div id="selBar" class="sel-bar glass" hidden>
+    <span id="selCount">Выбрано 0</span>
+    <button class="act" id="selFav">❤ В избранное</button>
+    <button class="act" id="selSafe">🔒 В сейф</button>
+    <button class="act" id="selAlbum">＋ В альбом</button>
+    <button class="act" id="selCopyFiles">Скопировать файлы</button>
+    <button class="act" id="selCopyPaths">Копировать пути</button>
+    <button class="act danger" id="selDelete">🗑 Удалить</button>
+    <button class="act" id="selClear">✕ Снять</button>
+  </div>
+</div>
+
+<div class="lb" id="lb">
+  <div class="lb-bg" data-close></div>
+  <div class="lb-close" data-close>✕</div>
+  <button class="lb-nav lb-prev" id="lbPrev">‹</button>
+  <button class="lb-nav lb-next" id="lbNext">›</button>
+  <div class="lb-viewport" id="lbViewport">
+    <div class="lb-stage" id="lbStage"></div>
+  </div>
+  <div class="lb-bar glass">
+    <div class="lb-text">
+      <div class="lb-name" id="lbName"></div>
+      <div class="lb-path" id="lbPath"></div>
+    </div>
+    <button class="act" id="lbFav" title="Избранное">♡</button>
+    <div class="rating" id="lbRating">
+      <span data-r="1">★</span><span data-r="2">★</span><span data-r="3">★</span><span data-r="4">★</span><span data-r="5">★</span>
+    </div>
+    <button class="act" id="lbZoomOut">−</button>
+    <button class="act" id="lbZoomReset">100%</button>
+    <button class="act" id="lbZoomIn">+</button>
+    <button class="act" id="lbReveal">Открыть папку</button>
+    <button class="act" id="lbOpen">Открыть</button>
+    <button class="act" id="lbSafe">🔒</button>
+    <button class="act" id="lbAlbum">＋ Альбом</button>
+    <button class="act" id="lbCopy">Путь</button>
+    <button class="act danger" id="lbDelete">🗑 Удалить</button>
+  </div>
+</div>
+
+<div class="modal" id="safeModal">
+  <div class="modal-bg" data-safemodal-close></div>
+  <div class="modal-card glass" id="safeCard"></div>
+</div>
+
+<div class="modal" id="albumModal">
+  <div class="modal-bg" data-albummodal-close></div>
+  <div class="modal-card glass">
+    <h3>Добавить в альбом</h3>
+    <div id="albumPickList" class="album-pick"></div>
+    <div class="modal-actions">
+      <button data-albummodal-close>Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="smartModal">
+  <div class="modal-bg" data-smartmodal-close></div>
+  <div class="modal-card glass">
+    <h3>Новый умный альбом</h3>
+    <input id="smartName" placeholder="Название" maxlength="60">
+    <label class="chk"><input type="checkbox" id="smartFav"> Только избранное</label>
+    <label class="chk"><input type="checkbox" id="smartGPS"> Только с геолокацией</label>
+    <label class="chk">Минимальный рейтинг:
+      <select id="smartRating"><option value="0">любой</option><option value="1">1+</option><option value="2">2+</option><option value="3">3+</option><option value="4">4+</option><option value="5">5</option></select>
+    </label>
+    <label class="chk">Тип:
+      <select id="smartType"><option value="">все</option><option value="image">фото</option><option value="video">видео</option></select>
+    </label>
+    <input id="smartQ" placeholder="Ключевое слово (необязательно)">
+    <div class="modal-actions">
+      <button data-smartmodal-close>Отмена</button>
+      <button class="primary" id="smartCreate">Создать</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+# Wails build output (содержит .exe/.app и обвязку)
+build/
+frontend/dist/wailsjs/
+
+# БД и кэш превью (создаются в %APPDATA% и %LOCALAPPDATA%, но на случай кастомных путей)
+*.db
+*.db-wal
+*.db-shm
+media-gallery/
+
+# Go
+*.exe
+*.exe~
+*.test
+*.out
+vendor/
+
+# Node (на будущее, если появится сборщик)
+node_modules/
+package-lock.json
+yarn.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Логи
+*.log
