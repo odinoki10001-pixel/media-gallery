@@ -12,7 +12,7 @@ const state = {
   items: [],
   currentIndex: -1,
   selected: new Set(),
-  lastClickedHash: null,   // было lastClickedIndex — теперь hash
+  lastClickedHash: null,
   loadingFlat: false,
   _fetchPage: null,
 };
@@ -46,12 +46,15 @@ function onProgress(p){
   const host = $('scanStatus');
   const lines = [];
   if (p.scanning){
-    const pct = p.found ? Math.round(p.processed * 100 / p.found) : 0;
-    lines.push('Сканирую: ' + p.processed.toLocaleString('ru') + ' / ' + p.found.toLocaleString('ru') + ' (' + pct + '%)');
-    lines.push('<div class="bar"><div style="width:' + pct + '%"></div></div>');
+    lines.push('Индексирую: ' + p.processed.toLocaleString('ru') + ' файлов…');
+  } else if (p.processed > 0){
+    lines.push('Проиндексировано: ' + p.processed.toLocaleString('ru') + ' файлов');
   }
-  if (p.thumbQ > 0) lines.push('Превью в очереди: ' + p.thumbQ.toLocaleString('ru'));
-  if (p.ocrQueue > 0 && p.ocrDone > 0) lines.push('OCR: ' + p.ocrDone.toLocaleString('ru') + ' / ' + (p.ocrDone + p.ocrQueue).toLocaleString('ru'));
+  if (p.thumbDone > 0) lines.push('Превью готово: ' + p.thumbDone.toLocaleString('ru'));
+  if (p.depsMessage){
+    const color = p.depsStatus === 'partial' ? '#ff8080' : '#ffb060';
+    lines.push('<span style="color:' + color + '">⚙ ' + escapeHtml(p.depsMessage) + '</span>');
+  }
   host.innerHTML = lines.join('<br>');
 }
 
@@ -412,7 +415,6 @@ function appendItems(grid, items){
     c.classList.add('observed');
     viewportIO.observe(c);
   });
-  // сохранить выделение, если пользователь уже что-то натыкал
   updateCardSelection();
 }
 
@@ -447,7 +449,6 @@ function createCard(m){
   name.className = 'name'; name.textContent = m.name;
   el.appendChild(name);
 
-  // Hash-based клик — работает даже если state.items мутировал
   el.addEventListener('click', (e) => {
     const hash = m.hash;
 
@@ -462,7 +463,6 @@ function createCard(m){
       selectRangeByHash(state.lastClickedHash, hash);
       return;
     }
-    // обычный клик — открыть лайтбокс
     const idx = state.items.findIndex(x => x.hash === hash);
     if (idx < 0) return;
     state.lastClickedHash = hash;
@@ -501,7 +501,7 @@ const viewportIO = new IntersectionObserver((entries) => {
   }
 }, { root: main, rootMargin: '3000px 0px' });
 
-// ---------- Выделение (hash-based) ----------
+// ---------- Выделение ----------
 
 function toggleSelect(hash){
   if (state.selected.has(hash)) state.selected.delete(hash);
@@ -510,8 +510,6 @@ function toggleSelect(hash){
   updateSelBar();
 }
 
-// Диапазон работает В ПРЕДЕЛАХ одного .grid (одной секции)
-// чтобы Shift+клик между секциями не захватывал чужие карточки.
 function selectRangeByHash(fromHash, toHash){
   const a = document.querySelector('.card[data-hash="' + cssEsc(fromHash) + '"]');
   const b = document.querySelector('.card[data-hash="' + cssEsc(toHash) + '"]');
@@ -521,7 +519,6 @@ function selectRangeByHash(fromHash, toHash){
   const gb = b.parentElement;
 
   if (ga !== gb){
-    // разные секции — выделяем только текущую карточку
     state.selected.add(toHash);
     state.lastClickedHash = toHash;
     updateCardSelection();
@@ -566,7 +563,6 @@ function clearSelection(){
   updateCardSelection(); updateSelBar();
 }
 
-// После удаления — убрать из selected и обнулить lastClickedHash, если он удалён.
 function dropHashesFromSelection(hashes){
   const set = new Set(hashes);
   for (const h of hashes) state.selected.delete(h);
@@ -678,7 +674,6 @@ function setupRubberBand(){
     const mr = main.parentElement.getBoundingClientRect();
     start = { x: e.clientX - mr.left + main.parentElement.scrollLeft,
               y: e.clientY - mr.top + main.scrollTop };
-    // Запоминаем выделение до рамки. Если Ctrl не зажат — сбрасываем.
     if (!e.ctrlKey && !e.metaKey) clearSelection();
     baseSelection = new Set(state.selected);
     rb.style.display = 'block';
@@ -710,12 +705,10 @@ function setupRubberBand(){
 }
 
 function updateRubberSelection(x1, y1, x2, y2, baseSelection){
-  // используем координаты относительно main (с учётом скролла)
   const mainRect = main.getBoundingClientRect();
   const scrollTop = main.scrollTop;
   const scrollLeft = main.scrollLeft;
 
-  // сбрасываем к базовому набору
   state.selected = new Set(baseSelection);
 
   document.querySelectorAll('.card').forEach(c => {
@@ -1055,82 +1048,163 @@ function openSafeUnlock(info){
   }
 }
 
-let patPoints = []; let patDragging = false;
+// ---------- Паттерн 3×3 ----------
+// Единственный источник истины — массив patPoints.
+// При любом изменении полностью перекрашиваем сетку и перерисовываем линии.
+// Это гарантирует, что подсвеченные точки и счётчик всегда синхронны.
+
+let patPoints = [];
+let patDragging = false;
+let patLastPos = null;
+
 function setupPattern(){
-  patPoints = []; patDragging = false;
-  const grid = $('patGrid'); if (!grid) return;
+  const grid = $('patGrid');
+  const svg = $('patSvg');
+  const wrap = $('patWrap');
+  if (!grid || !svg || !wrap) return;
+
+  patPoints = [];
+  patDragging = false;
+  patLastPos = null;
+
+  // создаём точки
   grid.innerHTML = '';
   for (let i = 0; i < 9; i++){
     const d = document.createElement('div');
-    d.className = 'pattern-dot'; d.dataset.i = i;
+    d.className = 'pattern-dot';
+    d.dataset.i = i;
     grid.appendChild(d);
   }
-  updatePatternStatus();
-  const svg = $('patSvg'); const wrap = $('patWrap');
-  if (!svg || !wrap) return;
-  const start = (e) => { e.preventDefault(); patDragging = true; patPoints = []; clearPatternVisual(); onMove(e); };
-  const move  = (e) => { if (!patDragging) return; e.preventDefault(); onMove(e); };
-  const end   = () => { patDragging = false; };
-  grid.addEventListener('mousedown', start);
-  wrap.addEventListener('mousemove', move);
-  window.addEventListener('mouseup', end);
-  wrap.addEventListener('touchstart', start, { passive: false });
-  wrap.addEventListener('touchmove', move, { passive: false });
-  wrap.addEventListener('touchend', end);
-  function onMove(e){
-    const rect = wrap.getBoundingClientRect();
-    const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
-    const y = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
-    grid.querySelectorAll('.pattern-dot').forEach(d => {
-      const r = d.getBoundingClientRect();
-      const cx = r.left + r.width/2 - rect.left;
-      const cy = r.top + r.height/2 - rect.top;
-      if (Math.hypot(cx - x, cy - y) < 28){
-        const idx = Number(d.dataset.i);
-        if (!patPoints.includes(idx)){
-          patPoints.push(idx); d.classList.add('on');
-          drawPatternLines(); updatePatternStatus();
-        }
-      }
-    });
+
+  function centerOf(idx){
+    const d = grid.querySelector('.pattern-dot[data-i="'+idx+'"]');
+    if (!d) return null;
+    const r = d.getBoundingClientRect();
+    const wr = wrap.getBoundingClientRect();
+    return { x: r.left + r.width/2 - wr.left, y: r.top + r.height/2 - wr.top };
   }
-  function drawPatternLines(){
-    svg.innerHTML = '';
-    if (!patPoints.length) return;
-    const dots = grid.querySelectorAll('.pattern-dot');
-    const wrapRect = wrap.getBoundingClientRect();
-    const pts = patPoints.map(i => {
-      const r = dots[i].getBoundingClientRect();
-      return { x: r.left + r.width/2 - wrapRect.left, y: r.top + r.height/2 - wrapRect.top };
+
+  function paint(){
+    // 1. подсветка — строго из массива
+    grid.querySelectorAll('.pattern-dot').forEach(d => {
+      const idx = Number(d.dataset.i);
+      d.classList.toggle('on', patPoints.includes(idx));
     });
-    for (let i = 0; i < pts.length - 1; i++){
+    // 2. линии
+    drawLines();
+    // 3. счётчик
+    const st = $('patStatus');
+    if (st) st.textContent = patPoints.length ? ('Точек: ' + patPoints.length) : 'Нарисуйте паттерн';
+  }
+
+  function drawLines(){
+    svg.innerHTML = '';
+    if (patPoints.length < 2) return;
+    const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
+    defs.innerHTML = '<linearGradient id="patGrad" x1="0" y1="0" x2="1" y2="1">' +
+      '<stop offset="0" stop-color="#7a6cff"/>' +
+      '<stop offset="1" stop-color="#00b4ff"/></linearGradient>';
+    svg.appendChild(defs);
+    for (let i = 0; i < patPoints.length - 1; i++){
+      const a = centerOf(patPoints[i]);
+      const b = centerOf(patPoints[i+1]);
+      if (!a || !b) continue;
       const l = document.createElementNS('http://www.w3.org/2000/svg','line');
-      l.setAttribute('x1', pts[i].x);   l.setAttribute('y1', pts[i].y);
-      l.setAttribute('x2', pts[i+1].x); l.setAttribute('y2', pts[i+1].y);
+      l.setAttribute('x1', a.x); l.setAttribute('y1', a.y);
+      l.setAttribute('x2', b.x); l.setAttribute('y2', b.y);
       l.setAttribute('stroke', 'url(#patGrad)');
       l.setAttribute('stroke-width', '4');
       l.setAttribute('stroke-linecap', 'round');
       svg.appendChild(l);
     }
-    if (!svg.querySelector('defs')){
-      const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
-      defs.innerHTML = '<linearGradient id="patGrad"><stop offset="0" stop-color="#7a6cff"/><stop offset="1" stop-color="#00b4ff"/></linearGradient>';
-      svg.insertBefore(defs, svg.firstChild);
+  }
+
+  function hit(px, py){
+    for (let i = 0; i < 9; i++){
+      const c = centerOf(i);
+      if (!c) continue;
+      if (Math.hypot(c.x - px, c.y - py) < 28){
+        if (!patPoints.includes(i)){
+          patPoints.push(i);
+          paint();
+        }
+      }
     }
   }
-  function updatePatternStatus(){
-    const st = $('patStatus'); if (!st) return;
-    st.textContent = patPoints.length ? ('Точек: ' + patPoints.length) : 'Нарисуйте паттерн';
+
+  function moveAt(clientX, clientY){
+    const wr = wrap.getBoundingClientRect();
+    const x = clientX - wr.left;
+    const y = clientY - wr.top;
+    if (patLastPos){
+      // интерполяция — иначе быстрые движения пропускают точки
+      const dist = Math.hypot(x - patLastPos.x, y - patLastPos.y);
+      const steps = Math.max(1, Math.ceil(dist / 4));
+      for (let s = 1; s <= steps; s++){
+        const px = patLastPos.x + (x - patLastPos.x) * (s / steps);
+        const py = patLastPos.y + (y - patLastPos.y) * (s / steps);
+        hit(px, py);
+      }
+    } else {
+      hit(x, y);
+    }
+    patLastPos = { x, y };
   }
-  function clearPatternVisual(){
-    grid.querySelectorAll('.pattern-dot').forEach(d => d.classList.remove('on'));
-    svg.innerHTML = ''; updatePatternStatus();
-  }
+
   wrap._getPattern = () => patPoints.join('-');
-  wrap._resetPattern = clearPatternVisual;
+  wrap._resetPattern = () => { patPoints = []; patLastPos = null; paint(); };
+
+  // навешиваем один раз на этот конкретный wrap
+  wrap._patAttached = true;
+
+  wrap.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    patDragging = true;
+    patPoints = [];
+    patLastPos = null;
+    paint();
+    const wr = wrap.getBoundingClientRect();
+    patLastPos = { x: e.clientX - wr.left, y: e.clientY - wr.top };
+    hit(patLastPos.x, patLastPos.y);
+  });
+  wrap.addEventListener('mousemove', (e) => {
+    if (!patDragging) return;
+    e.preventDefault();
+    moveAt(e.clientX, e.clientY);
+  });
+  wrap.addEventListener('mouseleave', () => { patDragging = false; patLastPos = null; });
+  window.addEventListener('mouseup', () => { patDragging = false; patLastPos = null; });
+
+  wrap.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    patDragging = true;
+    patPoints = [];
+    patLastPos = null;
+    paint();
+    const t = e.touches[0];
+    const wr = wrap.getBoundingClientRect();
+    patLastPos = { x: t.clientX - wr.left, y: t.clientY - wr.top };
+    hit(patLastPos.x, patLastPos.y);
+  }, { passive: false });
+  wrap.addEventListener('touchmove', (e) => {
+    if (!patDragging) return;
+    e.preventDefault();
+    const t = e.touches[0];
+    moveAt(t.clientX, t.clientY);
+  }, { passive: false });
+  wrap.addEventListener('touchend', () => { patDragging = false; patLastPos = null; });
+
+  paint();
 }
-function getPatternValue(){ const w = $('patWrap'); return (w && w._getPattern) ? w._getPattern() : ''; }
-function resetPattern(){ const w = $('patWrap'); if (w && w._resetPattern) w._resetPattern(); }
+
+function getPatternValue(){
+  const w = $('patWrap');
+  return (w && w._getPattern) ? w._getPattern() : '';
+}
+function resetPattern(){
+  const w = $('patWrap');
+  if (w && w._resetPattern) w._resetPattern();
+}
 
 // ---------- Горячие клавиши ----------
 

@@ -134,10 +134,6 @@ export function RevealInFileManager(arg1) {
   return window['go']['main']['App']['RevealInFileManager'](arg1);
 }
 
-export function RunOCR(arg1) {
-  return window['go']['main']['App']['RunOCR'](arg1);
-}
-
 export function SafeCount() {
   return window['go']['main']['App']['SafeCount']();
 }

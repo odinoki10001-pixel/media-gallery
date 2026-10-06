@@ -37,7 +37,6 @@ export namespace main {
 	    rating: number;
 	    lat: number;
 	    lon: number;
-	    hasOCR: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new Media(source);
@@ -61,7 +60,6 @@ export namespace main {
 	        this.rating = source["rating"];
 	        this.lat = source["lat"];
 	        this.lon = source["lon"];
-	        this.hasOCR = source["hasOCR"];
 	    }
 	}
 	export class DuplicateGroup {
@@ -119,12 +117,10 @@ export namespace main {
 	}
 	export class ScanProgress {
 	    scanning: boolean;
-	    found: number;
 	    processed: number;
 	    thumbDone: number;
-	    ocrDone: number;
-	    ocrQueue: number;
-	    thumbQ: number;
+	    depsStatus: string;
+	    depsMessage: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ScanProgress(source);
@@ -133,12 +129,10 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.scanning = source["scanning"];
-	        this.found = source["found"];
 	        this.processed = source["processed"];
 	        this.thumbDone = source["thumbDone"];
-	        this.ocrDone = source["ocrDone"];
-	        this.ocrQueue = source["ocrQueue"];
-	        this.thumbQ = source["thumbQ"];
+	        this.depsStatus = source["depsStatus"];
+	        this.depsMessage = source["depsMessage"];
 	    }
 	}
 	export class Section {

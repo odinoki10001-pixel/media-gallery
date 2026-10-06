@@ -169,17 +169,54 @@ button.act.danger:hover{background:rgba(255,80,80,.35);color:#fff}
   border-radius:18px;background:rgba(20,22,32,.9);box-shadow:0 30px 80px rgba(0,0,0,.6)}
 .modal-card h3{margin:0 0 14px;font-size:17px;font-weight:600}
 .modal-card p{margin:0 0 12px;font-size:13px;color:var(--text-dim)}
-.modal-card input,.modal-card select{width:100%;background:rgba(255,255,255,.08);
+
+.modal-card input:not([type="checkbox"]):not([type="radio"]),
+.modal-card select{
+  width:100%;background:rgba(255,255,255,.08);
   border:1px solid var(--glass-brd);color:#fff;padding:10px 12px;border-radius:10px;
-  outline:none;font-size:14px;font-family:inherit;margin-bottom:10px}
-.modal-card input:focus,.modal-card select:focus{border-color:rgba(122,108,255,.6)}
+  outline:none;font-size:14px;font-family:inherit;margin-bottom:10px;
+}
+.modal-card input:not([type="checkbox"]):not([type="radio"]):focus,
+.modal-card select:focus{border-color:rgba(122,108,255,.6)}
+
+.modal-card input[type="checkbox"],
+.modal-card input[type="radio"]{
+  width:auto;height:auto;margin:0;padding:0;flex:0 0 auto;
+  accent-color:#7a6cff;cursor:pointer;
+}
+
+.modal-card select{
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path fill='%23ffffff' fill-opacity='0.6' d='M6 8L0 0h12z'/></svg>");
+  background-repeat:no-repeat;
+  background-position:right 12px center;
+  background-size:10px 6px;
+  padding-right:34px;
+  color-scheme:dark;
+}
+.modal-card select option{
+  background-color:#0e1220;
+  color:#ffffff;
+  color-scheme:dark;
+}
+.modal-card select option:checked{
+  background-color:#7a6cff;
+  color:#fff;
+}
+
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .modal-actions button{background:rgba(255,255,255,.1);border:1px solid var(--glass-brd);
   color:#fff;padding:9px 16px;border-radius:10px;cursor:pointer;font-family:inherit;font-size:13px}
 .modal-actions button.primary{background:linear-gradient(135deg,#7a6cff,#00b4ff);border:0;font-weight:600}
 .modal-actions button:disabled{opacity:.5;cursor:not-allowed}
-.chk{display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;color:var(--text-dim)}
-.chk select{width:auto;margin:0;padding:6px 10px}
+
+.chk{
+  display:flex;align-items:center;gap:10px;
+  font-size:13px;margin-bottom:8px;color:var(--text-dim);
+  cursor:pointer;user-select:none;
+}
+.chk select{width:auto;margin:0;padding:6px 30px 6px 10px;flex:0 0 auto}
+.chk input[type="checkbox"]{width:16px;height:16px}
 
 .pattern-wrap{display:flex;justify-content:center;margin:10px 0 4px;position:relative;width:260px;height:260px}
 .pattern-grid{position:absolute;inset:0;display:grid;grid-template-columns:repeat(3,1fr);

@@ -68,8 +68,6 @@ export function RenameAlbum(arg1:number,arg2:string):Promise<void>;
 
 export function RevealInFileManager(arg1:string):Promise<void>;
 
-export function RunOCR(arg1:string):Promise<string>;
-
 export function SafeCount():Promise<number>;
 
 export function SafeInfo():Promise<main.SafeInfo>;

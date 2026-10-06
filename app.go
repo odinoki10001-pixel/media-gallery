@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha1"
@@ -32,6 +33,8 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+// ---------- типы ----------
+
 type Media struct {
 	Hash     string  `json:"hash"`
 	Path     string  `json:"path"`
@@ -49,7 +52,6 @@ type Media struct {
 	Rating   int     `json:"rating"`
 	Lat      float64 `json:"lat"`
 	Lon      float64 `json:"lon"`
-	HasOCR   bool    `json:"hasOCR"`
 }
 
 type Section struct {
@@ -75,14 +77,283 @@ type SmartAlbum struct {
 }
 
 type ScanProgress struct {
-	Scanning  bool `json:"scanning"`
-	Found     int  `json:"found"`
-	Processed int  `json:"processed"`
-	ThumbDone int  `json:"thumbDone"`
-	OCRDone   int  `json:"ocrDone"`
-	OCRQueue  int  `json:"ocrQueue"`
-	ThumbQ    int  `json:"thumbQ"`
+	Scanning    bool   `json:"scanning"`
+	Processed   int    `json:"processed"`
+	ThumbDone   int    `json:"thumbDone"`
+	DepsStatus  string `json:"depsStatus"`
+	DepsMessage string `json:"depsMessage"`
 }
+
+// ---------- DepManager ----------
+
+type DepManager struct {
+	binDir string
+	mu     sync.Mutex
+
+	status  atomic.Value
+	message atomic.Value
+}
+
+func NewDepManager() *DepManager {
+	cache, _ := os.UserCacheDir()
+	binDir := filepath.Join(cache, "media-gallery", "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+
+	d := &DepManager{binDir: binDir}
+	d.status.Store("idle")
+	d.message.Store("")
+	return d
+}
+
+func (d *DepManager) Status() (string, string) {
+	return d.status.Load().(string), d.message.Load().(string)
+}
+
+func (d *DepManager) setStatus(s, msg string) {
+	d.status.Store(s)
+	d.message.Store(msg)
+}
+
+func (d *DepManager) exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
+func (d *DepManager) FFmpegPath() string {
+	return filepath.Join(d.binDir, "ffmpeg"+d.exeSuffix())
+}
+
+func (d *DepManager) FFprobePath() string {
+	return filepath.Join(d.binDir, "ffprobe"+d.exeSuffix())
+}
+
+func (d *DepManager) MagickPath() string {
+	return filepath.Join(d.binDir, "magick"+d.exeSuffix())
+}
+
+func (d *DepManager) EnsureAll() {
+	d.setStatus("downloading", "Подготовка инструментов…")
+
+	needFF := !fileExists(d.FFmpegPath())
+	needMagick := !fileExists(d.MagickPath())
+
+	if !needFF && !needMagick {
+		d.setStatus("ready", "Все инструменты готовы")
+		time.Sleep(3 * time.Second)
+		d.setStatus("idle", "")
+		return
+	}
+
+	var failed []string
+
+	if needFF {
+		if err := d.ensureFFmpeg(); err != nil {
+			log.Printf("[deps] ffmpeg: %v", err)
+			failed = append(failed, "ffmpeg")
+		}
+	}
+	if needMagick {
+		if err := d.ensureImageMagick(); err != nil {
+			log.Printf("[deps] imagemagick: %v", err)
+			failed = append(failed, "ImageMagick")
+		}
+	}
+
+	if len(failed) > 0 {
+		d.setStatus("partial", "Не удалось скачать: "+strings.Join(failed, ", "))
+	} else {
+		d.setStatus("ready", "Все инструменты готовы")
+	}
+	time.Sleep(3 * time.Second)
+	d.setStatus("idle", "")
+}
+
+func (d *DepManager) ensureFFmpeg() error {
+	if runtime.GOOS != "windows" {
+		return fmt.Errorf("автоскачивание ffmpeg реализовано только для Windows")
+	}
+	url := "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+
+	d.setStatus("downloading", "Скачиваю ffmpeg…")
+	tmp, err := d.downloadToTemp(url, "ffmpeg", "ffmpeg")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+
+	d.setStatus("installing", "Распаковываю ffmpeg…")
+	if err := d.extractFromZip(tmp, "ffmpeg.exe", d.FFmpegPath()); err != nil {
+		return err
+	}
+	_ = d.extractFromZip(tmp, "ffprobe.exe", d.FFprobePath())
+	return nil
+}
+
+func (d *DepManager) ensureImageMagick() error {
+	if runtime.GOOS != "windows" {
+		return fmt.Errorf("автоскачивание ImageMagick реализовано только для Windows")
+	}
+	url := "https://imagemagick.org/archive/binaries/ImageMagick-7.1.1-38-portable-Q16-HDRI-x64.zip"
+
+	d.setStatus("downloading", "Скачиваю ImageMagick…")
+	tmp, err := d.downloadToTemp(url, "imagemagick", "ImageMagick")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+
+	d.setStatus("installing", "Распаковываю ImageMagick…")
+	return d.extractAllFromZip(tmp, d.binDir, func(rel string) bool {
+		base := strings.ToLower(filepath.Base(rel))
+		return strings.HasSuffix(base, ".exe") || strings.HasSuffix(base, ".dll") ||
+			strings.HasSuffix(base, ".xml") || strings.HasSuffix(base, ".icc")
+	})
+}
+
+func (d *DepManager) downloadToTemp(url, kind, label string) (string, error) {
+	tmp, err := os.CreateTemp("", "mg-"+kind+"-*")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	tmp.Close()
+
+	if err := d.downloadFile(url, name, label); err != nil {
+		os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+func (d *DepManager) downloadFile(url, dest, label string) error {
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("GET: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %s", resp.Status)
+	}
+
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	total := resp.ContentLength
+	var written int64
+	buf := make([]byte, 64*1024)
+	lastUpdate := time.Now()
+
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			written += int64(n)
+			if time.Since(lastUpdate) > 200*time.Millisecond {
+				if total > 0 {
+					d.setStatus("downloading", fmt.Sprintf("%s: %s / %s",
+						label, humanBytes(written), humanBytes(total)))
+				} else {
+					d.setStatus("downloading", fmt.Sprintf("%s: %s", label, humanBytes(written)))
+				}
+				lastUpdate = time.Now()
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+	}
+	return nil
+}
+
+func (d *DepManager) extractFromZip(zipPath, baseName, destPath string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if filepath.Base(f.Name) != baseName {
+			continue
+		}
+		return writeZipEntry(f, destPath)
+	}
+	return fmt.Errorf("%s не найден в архиве", baseName)
+}
+
+func (d *DepManager) extractAllFromZip(zipPath, destDir string, keep func(rel string) bool) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		if keep != nil && !keep(f.Name) {
+			continue
+		}
+		rel := filepath.Base(f.Name)
+		dest := filepath.Join(destDir, rel)
+		if err := writeZipEntry(f, dest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeZipEntry(f *zip.File, dest string) error {
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	_ = os.MkdirAll(filepath.Dir(dest), 0o755)
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, rc)
+	return err
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Size() > 0
+}
+
+func humanBytes(n int64) string {
+	const k = 1024
+	switch {
+	case n < k:
+		return fmt.Sprintf("%d Б", n)
+	case n < k*k:
+		return fmt.Sprintf("%.1f КБ", float64(n)/k)
+	case n < k*k*k:
+		return fmt.Sprintf("%.1f МБ", float64(n)/k/k)
+	default:
+		return fmt.Sprintf("%.2f ГБ", float64(n)/k/k/k)
+	}
+}
+
+// ---------- App ----------
 
 type App struct {
 	ctx      context.Context
@@ -90,33 +361,30 @@ type App struct {
 	thumbDir string
 	watcher  *fsnotify.Watcher
 	roots    []string
+	depMgr   *DepManager
 
 	mu       sync.Mutex
 	pending  map[string]struct{}
 	unlocked bool
-	hasIM    bool
-	hasFF    bool
-	hasTess  bool
+
+	hasFF atomic.Bool
+	hasIM atomic.Bool
 
 	scanning  atomic.Bool
-	found     atomic.Int64
 	processed atomic.Int64
 	thumbDone atomic.Int64
-	ocrDone   atomic.Int64
-	ocrQueue  atomic.Int64
-	thumbQ    atomic.Int64
 
 	thumbWake chan struct{}
-	ocrWake   chan struct{}
 }
 
 func NewApp() *App {
 	return &App{
 		pending:   map[string]struct{}{},
 		thumbWake: make(chan struct{}, 1),
-		ocrWake:   make(chan struct{}, 1),
 	}
 }
+
+// ---------- жизненный цикл ----------
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
@@ -161,32 +429,23 @@ func (a *App) startup(ctx context.Context) {
 	}
 	for col, def := range need {
 		if !cols[col] {
-			log.Printf("[startup] adding albums.%s", col)
 			if _, err := a.db.Exec("ALTER TABLE albums ADD COLUMN " + col + " " + def); err != nil {
 				log.Printf("[startup] ALTER albums.%s: %v", col, err)
 			}
 		}
 	}
 
-	a.hasFF = toolExists("ffmpeg")
-	a.hasIM = toolExists("magick") || toolExists("convert")
-	a.hasTess = toolExists("tesseract")
+	a.depMgr = NewDepManager()
+	a.refreshToolFlags()
+	a.logToolFlags()
 
-	if !a.hasFF {
-		log.Println("⚠ ffmpeg not found — видео-превью работать не будут")
-	} else {
-		log.Println("✓ ffmpeg найден")
-	}
-	if !a.hasIM {
-		log.Println("⚠ ImageMagick not found")
-	} else {
-		log.Println("✓ ImageMagick найден")
-	}
-	if !a.hasTess {
-		log.Println("⚠ tesseract not found — OCR отключён")
-	} else {
-		log.Println("✓ tesseract найден")
-	}
+	go func() {
+		time.Sleep(2 * time.Second)
+		a.depMgr.EnsureAll()
+		a.refreshToolFlags()
+		a.logToolFlags()
+		a.enqueueMissingThumbs()
+	}()
 
 	home, _ := os.UserHomeDir()
 	a.roots = []string{home}
@@ -197,8 +456,50 @@ func (a *App) startup(ctx context.Context) {
 	go a.fullScan()
 	go a.startWatcher()
 	go a.thumbWorker()
-	go a.ocrWorker()
 	go a.progressLoop()
+}
+
+func (a *App) refreshToolFlags() {
+	a.hasFF.Store(a.toolPath("ffmpeg", a.depMgr.FFmpegPath()) != "")
+	a.hasIM.Store(a.toolPath("magick", a.depMgr.MagickPath()) != "" ||
+		a.toolPath("convert", "") != "")
+}
+
+func (a *App) toolPath(name, localPath string) string {
+	if localPath != "" && fileExists(localPath) {
+		return localPath
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	return ""
+}
+
+func (a *App) ffmpegCmd(args ...string) *exec.Cmd {
+	return hiddenCmd(a.toolPath("ffmpeg", a.depMgr.FFmpegPath()), args...)
+}
+
+func (a *App) magickCmd(args ...string) *exec.Cmd {
+	if a.depMgr != nil && fileExists(a.depMgr.MagickPath()) {
+		return hiddenCmd(a.depMgr.MagickPath(), args...)
+	}
+	if p, err := exec.LookPath("magick"); err == nil {
+		return hiddenCmd(p, args...)
+	}
+	return hiddenCmd("convert", args...)
+}
+
+func (a *App) logToolFlags() {
+	if !a.hasFF.Load() {
+		log.Println("⚠ ffmpeg недоступен")
+	} else {
+		log.Println("✓ ffmpeg готов")
+	}
+	if !a.hasIM.Load() {
+		log.Println("⚠ ImageMagick недоступен")
+	} else {
+		log.Println("✓ ImageMagick готов")
+	}
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -208,11 +509,6 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.db != nil {
 		_ = a.db.Close()
 	}
-}
-
-func toolExists(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
 }
 
 func (a *App) initSchema() error {
@@ -233,7 +529,6 @@ func (a *App) initSchema() error {
 			width        INTEGER NOT NULL DEFAULT 0,
 			height       INTEGER NOT NULL DEFAULT 0,
 			camera       TEXT NOT NULL DEFAULT '',
-			ocr_text     TEXT NOT NULL DEFAULT '',
 			in_safe      INTEGER NOT NULL DEFAULT 0,
 			favorite     INTEGER NOT NULL DEFAULT 0,
 			rating       INTEGER NOT NULL DEFAULT 0,
@@ -274,7 +569,6 @@ func (a *App) initSchema() error {
 		{"width", "INTEGER NOT NULL DEFAULT 0"},
 		{"height", "INTEGER NOT NULL DEFAULT 0"},
 		{"camera", "TEXT NOT NULL DEFAULT ''"},
-		{"ocr_text", "TEXT NOT NULL DEFAULT ''"},
 		{"in_safe", "INTEGER NOT NULL DEFAULT 0"},
 		{"favorite", "INTEGER NOT NULL DEFAULT 0"},
 		{"rating", "INTEGER NOT NULL DEFAULT 0"},
@@ -295,25 +589,32 @@ func (a *App) initSchema() error {
 	_, _ = a.db.Exec(`UPDATE media SET name_lower = LOWER(name) WHERE name_lower = ''`)
 	_, _ = a.db.Exec(`UPDATE media SET path_lower = LOWER(path) WHERE path_lower = ''`)
 
+	// FTS5 по имени, пути, камере. OCR-колонка удалена.
+	_, _ = a.db.Exec(`
+		DROP TRIGGER IF EXISTS media_ai;
+		DROP TRIGGER IF EXISTS media_ad;
+		DROP TRIGGER IF EXISTS media_au;
+		DROP TABLE IF EXISTS media_fts;
+	`)
 	_, _ = a.db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
-			name, path, ocr_text, camera,
+			name, path, camera,
 			content='media', content_rowid='id',
 			tokenize='unicode61 remove_diacritics 2'
 		);
 		CREATE TRIGGER IF NOT EXISTS media_ai AFTER INSERT ON media BEGIN
-			INSERT INTO media_fts(rowid, name, path, ocr_text, camera)
-			VALUES (new.id, new.name, new.path, new.ocr_text, new.camera);
+			INSERT INTO media_fts(rowid, name, path, camera)
+			VALUES (new.id, new.name, new.path, new.camera);
 		END;
 		CREATE TRIGGER IF NOT EXISTS media_ad AFTER DELETE ON media BEGIN
-			INSERT INTO media_fts(media_fts, rowid, name, path, ocr_text, camera)
-			VALUES ('delete', old.id, old.name, old.path, old.ocr_text, old.camera);
+			INSERT INTO media_fts(media_fts, rowid, name, path, camera)
+			VALUES ('delete', old.id, old.name, old.path, old.camera);
 		END;
 		CREATE TRIGGER IF NOT EXISTS media_au AFTER UPDATE ON media BEGIN
-			INSERT INTO media_fts(media_fts, rowid, name, path, ocr_text, camera)
-			VALUES ('delete', old.id, old.name, old.path, old.ocr_text, old.camera);
-			INSERT INTO media_fts(rowid, name, path, ocr_text, camera)
-			VALUES (new.id, new.name, new.path, new.ocr_text, new.camera);
+			INSERT INTO media_fts(media_fts, rowid, name, path, camera)
+			VALUES ('delete', old.id, old.name, old.path, old.camera);
+			INSERT INTO media_fts(rowid, name, path, camera)
+			VALUES (new.id, new.name, new.path, new.camera);
 		END;
 	`)
 	_, _ = a.db.Exec(`INSERT INTO media_fts(media_fts) VALUES('rebuild')`)
@@ -331,6 +632,8 @@ func (a *App) initSchema() error {
 	`)
 	return err
 }
+
+// ---------- форматы ----------
 
 var imageExts = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -505,29 +808,14 @@ func safeFloat(v float64) float64 {
 	return v
 }
 
+// ---------- сканирование ----------
+
 func (a *App) fullScan() {
 	a.scanning.Store(true)
 	defer a.scanning.Store(false)
 
-	for _, root := range a.roots {
-		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() {
-				name := d.Name()
-				if strings.HasPrefix(name, ".") || skipDirs[name] {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if classify(strings.ToLower(filepath.Ext(path))) != "" {
-				a.found.Add(1)
-			}
-			return nil
-		})
-	}
-	log.Println("files found:", a.found.Load())
+	a.processed.Store(0)
+	a.thumbDone.Store(0)
 
 	for _, root := range a.roots {
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -539,6 +827,9 @@ func (a *App) fullScan() {
 				if strings.HasPrefix(name, ".") || skipDirs[name] {
 					return filepath.SkipDir
 				}
+				return nil
+			}
+			if classify(strings.ToLower(filepath.Ext(path))) == "" {
 				return nil
 			}
 			a.indexFile(path, d)
@@ -546,9 +837,7 @@ func (a *App) fullScan() {
 			return nil
 		})
 	}
-	log.Println("full scan done")
-	a.enqueueMissingOCR()
-	a.enqueueMissingThumbs()
+	log.Println("full scan done, processed:", a.processed.Load())
 }
 
 func (a *App) indexFile(path string, d fs.DirEntry) {
@@ -622,23 +911,21 @@ func (a *App) removeByPath(path string) {
 	_, _ = a.db.Exec(`DELETE FROM media WHERE path = ?`, path)
 }
 
-const mediaCols = `hash, path, name, ext, type, size, mod_time, taken_at, width, height, camera, in_safe, favorite, rating, lat, lon, ocr_text`
+const mediaCols = `hash, path, name, ext, type, size, mod_time, taken_at, width, height, camera, in_safe, favorite, rating, lat, lon`
 
 func scanMedia(rows *sql.Rows) []Media {
 	out := make([]Media, 0)
 	for rows.Next() {
 		var m Media
 		var inSafe, fav, rating int
-		var ocr string
 		if err := rows.Scan(&m.Hash, &m.Path, &m.Name, &m.Ext, &m.Type,
 			&m.Size, &m.ModTime, &m.TakenAt, &m.Width, &m.Height, &m.Camera,
-			&inSafe, &fav, &rating, &m.Lat, &m.Lon, &ocr); err != nil {
+			&inSafe, &fav, &rating, &m.Lat, &m.Lon); err != nil {
 			continue
 		}
 		m.InSafe = inSafe != 0
 		m.Favorite = fav != 0
 		m.Rating = rating
-		m.HasOCR = ocr != ""
 		out = append(out, m)
 	}
 	return out
@@ -648,16 +935,14 @@ func (a *App) getByHash(hash string) (Media, bool) {
 	row := a.db.QueryRow(`SELECT `+mediaCols+` FROM media WHERE hash = ?`, hash)
 	var m Media
 	var inSafe, fav, rating int
-	var ocr string
 	if err := row.Scan(&m.Hash, &m.Path, &m.Name, &m.Ext, &m.Type,
 		&m.Size, &m.ModTime, &m.TakenAt, &m.Width, &m.Height, &m.Camera,
-		&inSafe, &fav, &rating, &m.Lat, &m.Lon, &ocr); err != nil {
+		&inSafe, &fav, &rating, &m.Lat, &m.Lon); err != nil {
 		return Media{}, false
 	}
 	m.InSafe = inSafe != 0
 	m.Favorite = fav != 0
 	m.Rating = rating
-	m.HasOCR = ocr != ""
 	return m, true
 }
 
@@ -665,18 +950,18 @@ func (a *App) getByPath(path string) (Media, bool) {
 	row := a.db.QueryRow(`SELECT `+mediaCols+` FROM media WHERE path = ?`, path)
 	var m Media
 	var inSafe, fav, rating int
-	var ocr string
 	if err := row.Scan(&m.Hash, &m.Path, &m.Name, &m.Ext, &m.Type,
 		&m.Size, &m.ModTime, &m.TakenAt, &m.Width, &m.Height, &m.Camera,
-		&inSafe, &fav, &rating, &m.Lat, &m.Lon, &ocr); err != nil {
+		&inSafe, &fav, &rating, &m.Lat, &m.Lon); err != nil {
 		return Media{}, false
 	}
 	m.InSafe = inSafe != 0
 	m.Favorite = fav != 0
 	m.Rating = rating
-	m.HasOCR = ocr != ""
 	return m, true
 }
+
+// ---------- fsnotify ----------
 
 func (a *App) startWatcher() {
 	w, err := fsnotify.NewWatcher()
@@ -797,31 +1082,9 @@ func (a *App) flushLoop() {
 	}
 }
 
+// ---------- воркер превью ----------
+
 func (a *App) enqueueMissingThumbs() {
-	rows, err := a.db.Query(`SELECT ` + mediaCols + ` FROM media WHERE in_safe = 0`)
-	if err != nil {
-		return
-	}
-	var list []Media
-	for rows.Next() {
-		var m Media
-		var inSafe, fav, rating int
-		var ocr string
-		if err := rows.Scan(&m.Hash, &m.Path, &m.Name, &m.Ext, &m.Type,
-			&m.Size, &m.ModTime, &m.TakenAt, &m.Width, &m.Height, &m.Camera,
-			&inSafe, &fav, &rating, &m.Lat, &m.Lon, &ocr); err != nil {
-			continue
-		}
-		list = append(list, m)
-	}
-	rows.Close()
-	for _, m := range list {
-		p := filepath.Join(a.thumbDir, m.Hash+".jpg")
-		if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
-			continue
-		}
-		a.thumbQ.Add(1)
-	}
 	select {
 	case a.thumbWake <- struct{}{}:
 	default:
@@ -843,10 +1106,9 @@ func (a *App) thumbWorker() {
 		for rows.Next() {
 			var m Media
 			var inSafe, fav, rating int
-			var ocr string
 			if err := rows.Scan(&m.Hash, &m.Path, &m.Name, &m.Ext, &m.Type,
 				&m.Size, &m.ModTime, &m.TakenAt, &m.Width, &m.Height, &m.Camera,
-				&inSafe, &fav, &rating, &m.Lat, &m.Lon, &ocr); err != nil {
+				&inSafe, &fav, &rating, &m.Lat, &m.Lon); err != nil {
 				continue
 			}
 			list = append(list, m)
@@ -859,90 +1121,13 @@ func (a *App) thumbWorker() {
 			}
 			if _, err := a.generateThumb(m); err == nil {
 				a.thumbDone.Add(1)
-				if a.thumbQ.Load() > 0 {
-					a.thumbQ.Add(-1)
-				}
 			}
-			time.Sleep(30 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }
 
-func (a *App) enqueueMissingOCR() {
-	if !a.hasTess {
-		return
-	}
-	var n int
-	_ = a.db.QueryRow(`SELECT COUNT(*) FROM media WHERE type='image' AND ocr_text = '' AND in_safe = 0`).Scan(&n)
-	a.ocrQueue.Store(int64(n))
-	select {
-	case a.ocrWake <- struct{}{}:
-	default:
-	}
-}
-
-func (a *App) ocrWorker() {
-	if !a.hasTess {
-		return
-	}
-	for {
-		select {
-		case <-a.ocrWake:
-		case <-time.After(30 * time.Second):
-		}
-		for {
-			var m Media
-			rows, err := a.db.Query(`SELECT ` + mediaCols + ` FROM media
-				WHERE type='image' AND ocr_text='' AND in_safe=0
-				  AND ext NOT IN ('.heic','.heif','.avif')
-				LIMIT 1`)
-			if err != nil {
-				break
-			}
-			ok := false
-			if rows.Next() {
-				var inSafe, fav, rating int
-				var ocr string
-				if err := rows.Scan(&m.Hash, &m.Path, &m.Name, &m.Ext, &m.Type,
-					&m.Size, &m.ModTime, &m.TakenAt, &m.Width, &m.Height, &m.Camera,
-					&inSafe, &fav, &rating, &m.Lat, &m.Lon, &ocr); err == nil {
-					ok = true
-				}
-			}
-			rows.Close()
-			if !ok {
-				break
-			}
-			_ = a.runOCRFor(m)
-			a.ocrDone.Add(1)
-			if a.ocrQueue.Load() > 0 {
-				a.ocrQueue.Add(-1)
-			}
-			time.Sleep(150 * time.Millisecond)
-		}
-	}
-}
-
-func (a *App) runOCRFor(m Media) error {
-	p, err := a.generateThumb(m)
-	if err != nil {
-		return err
-	}
-	tmp, err := os.MkdirTemp("", "ocr-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmp)
-	outBase := filepath.Join(tmp, "out")
-	cmd := exec.Command("tesseract", p, outBase, "-l", "rus+eng", "--psm", "3")
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-	b, _ := os.ReadFile(outBase + ".txt")
-	txt := strings.TrimSpace(string(b))
-	_, err = a.db.Exec(`UPDATE media SET ocr_text = ? WHERE hash = ?`, txt, m.Hash)
-	return err
-}
+// ---------- прогресс ----------
 
 func (a *App) progressLoop() {
 	t := time.NewTicker(500 * time.Millisecond)
@@ -951,29 +1136,35 @@ func (a *App) progressLoop() {
 		if a.ctx == nil {
 			continue
 		}
+		ds, dm := "idle", ""
+		if a.depMgr != nil {
+			ds, dm = a.depMgr.Status()
+		}
 		wailsruntime.EventsEmit(a.ctx, "progress", ScanProgress{
-			Scanning:  a.scanning.Load(),
-			Found:     int(a.found.Load()),
-			Processed: int(a.processed.Load()),
-			ThumbDone: int(a.thumbDone.Load()),
-			OCRDone:   int(a.ocrDone.Load()),
-			OCRQueue:  int(a.ocrQueue.Load()),
-			ThumbQ:    int(a.thumbQ.Load()),
+			Scanning:    a.scanning.Load(),
+			Processed:   int(a.processed.Load()),
+			ThumbDone:   int(a.thumbDone.Load()),
+			DepsStatus:  ds,
+			DepsMessage: dm,
 		})
 	}
 }
 
 func (a *App) GetProgress() ScanProgress {
+	ds, dm := "idle", ""
+	if a.depMgr != nil {
+		ds, dm = a.depMgr.Status()
+	}
 	return ScanProgress{
-		Scanning:  a.scanning.Load(),
-		Found:     int(a.found.Load()),
-		Processed: int(a.processed.Load()),
-		ThumbDone: int(a.thumbDone.Load()),
-		OCRDone:   int(a.ocrDone.Load()),
-		OCRQueue:  int(a.ocrQueue.Load()),
-		ThumbQ:    int(a.thumbQ.Load()),
+		Scanning:    a.scanning.Load(),
+		Processed:   int(a.processed.Load()),
+		ThumbDone:   int(a.thumbDone.Load()),
+		DepsStatus:  ds,
+		DepsMessage: dm,
 	}
 }
+
+// ---------- превью ----------
 
 var thumbSem = make(chan struct{}, 4)
 
@@ -995,7 +1186,7 @@ func (a *App) generateThumb(m Media) (string, error) {
 			}
 		}
 	}
-	if a.hasFF {
+	if a.hasFF.Load() {
 		vf := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d",
 			thumbSize, thumbSize, thumbSize, thumbSize)
 		var args []string
@@ -1004,22 +1195,20 @@ func (a *App) generateThumb(m Media) (string, error) {
 		} else {
 			args = []string{"-y", "-i", m.Path, "-vf", vf, "-frames:v", "1", "-q:v", "3", out}
 		}
-		if err := exec.Command("ffmpeg", args...).Run(); err == nil {
+		if err := a.ffmpegCmd(args...).Run(); err == nil {
 			if fi, err := os.Stat(out); err == nil && fi.Size() > 0 {
 				return out, nil
 			}
 		}
 	}
-	if a.hasIM {
-		for _, c := range []string{"magick", "convert"} {
-			args := []string{m.Path + "[0]",
-				"-resize", fmt.Sprintf("%dx%d^", thumbSize, thumbSize),
-				"-gravity", "center", "-extent", fmt.Sprintf("%dx%d", thumbSize, thumbSize),
-				"-quality", "80", out}
-			if err := exec.Command(c, args...).Run(); err == nil {
-				if fi, err := os.Stat(out); err == nil && fi.Size() > 0 {
-					return out, nil
-				}
+	if a.hasIM.Load() {
+		args := []string{m.Path + "[0]",
+			"-resize", fmt.Sprintf("%dx%d^", thumbSize, thumbSize),
+			"-gravity", "center", "-extent", fmt.Sprintf("%dx%d", thumbSize, thumbSize),
+			"-quality", "80", out}
+		if err := a.magickCmd(args...).Run(); err == nil {
+			if fi, err := os.Stat(out); err == nil && fi.Size() > 0 {
+				return out, nil
 			}
 		}
 	}
@@ -1061,6 +1250,8 @@ func (a *App) handleFile(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, m.Path)
 }
 
+// ---------- поиск ----------
+
 func ftsQuery(q string) string {
 	q = strings.TrimSpace(q)
 	if q == "" {
@@ -1080,33 +1271,46 @@ func (a *App) Search(query, typ string, limit, offset int) []Media {
 	}
 	q := strings.TrimSpace(query)
 
-	var rows *sql.Rows
-	var err error
 	if q == "" {
-		rows, err = a.db.Query(`
+		rows, err := a.db.Query(`
 			SELECT `+mediaCols+` FROM media
 			WHERE (? = '' OR type = ?) AND in_safe = 0
 			ORDER BY taken_at DESC LIMIT ? OFFSET ?`, typ, typ, limit, offset)
-	} else if fq := ftsQuery(q); fq != "" {
-		rows, err = a.db.Query(`
+		if err != nil {
+			return []Media{}
+		}
+		defer rows.Close()
+		return scanMedia(rows)
+	}
+
+	if fq := ftsQuery(q); fq != "" {
+		rows, err := a.db.Query(`
 			SELECT m.`+strings.ReplaceAll(mediaCols, ", ", ", m.")+`
 			FROM media m
 			JOIN media_fts f ON f.rowid = m.id
 			WHERE media_fts MATCH ? AND (? = '' OR m.type = ?) AND m.in_safe = 0
 			ORDER BY m.taken_at DESC LIMIT ? OFFSET ?`,
 			fq, typ, typ, limit, offset)
+		if err == nil {
+			out := scanMedia(rows)
+			rows.Close()
+			if len(out) > 0 {
+				return out
+			}
+		} else if rows != nil {
+			rows.Close()
+		}
 	}
-	if err != nil || rows == nil {
-		lq := "%" + strings.ToLower(q) + "%"
-		rows, err = a.db.Query(`
-			SELECT `+mediaCols+` FROM media
-			WHERE (? = '' OR type = ?) AND in_safe = 0
-			  AND (name_lower LIKE ? OR path_lower LIKE ? OR LOWER(ocr_text) LIKE ?)
-			ORDER BY taken_at DESC LIMIT ? OFFSET ?`,
-			typ, typ, lq, lq, lq, limit, offset)
-	}
+
+	lq := "%" + strings.ToLower(q) + "%"
+	rows, err := a.db.Query(`
+		SELECT `+mediaCols+` FROM media
+		WHERE (? = '' OR type = ?) AND in_safe = 0
+		  AND (name_lower LIKE ? OR path_lower LIKE ? OR LOWER(camera) LIKE ?)
+		ORDER BY taken_at DESC LIMIT ? OFFSET ?`,
+		typ, typ, lq, lq, lq, limit, offset)
 	if err != nil {
-		log.Println("Search:", err)
+		log.Println("Search LIKE:", err)
 		return []Media{}
 	}
 	defer rows.Close()
@@ -1127,7 +1331,7 @@ func (a *App) TotalCount(query, typ string) int {
 			JOIN media_fts f ON f.rowid = m.id
 			WHERE media_fts MATCH ? AND (?='' OR m.type=?) AND m.in_safe=0`,
 			fq, typ, typ).Scan(&n)
-		if err == nil {
+		if err == nil && n > 0 {
 			return n
 		}
 	}
@@ -1135,10 +1339,12 @@ func (a *App) TotalCount(query, typ string) int {
 	_ = a.db.QueryRow(`
 		SELECT COUNT(*) FROM media
 		WHERE (?='' OR type=?) AND in_safe=0
-		  AND (name_lower LIKE ? OR path_lower LIKE ? OR LOWER(ocr_text) LIKE ?)`,
+		  AND (name_lower LIKE ? OR path_lower LIKE ? OR LOWER(camera) LIKE ?)`,
 		typ, typ, lq, lq, lq).Scan(&n)
 	return n
 }
+
+// ---------- секции по датам ----------
 
 var monthsRu = [...]string{
 	"Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -1230,6 +1436,8 @@ func (a *App) GetSectionItems(from, to int64, typ string, offset, limit int) []M
 	return scanMedia(rows)
 }
 
+// ---------- избранное / рейтинг ----------
+
 func (a *App) ToggleFavorite(hash string) (bool, error) {
 	var cur int
 	if err := a.db.QueryRow(`SELECT favorite FROM media WHERE hash=?`, hash).Scan(&cur); err != nil {
@@ -1311,6 +1519,8 @@ func (a *App) GeoItems(offset, limit int) []Media {
 	defer rows.Close()
 	return scanMedia(rows)
 }
+
+// ---------- альбомы ----------
 
 func (a *App) ListAlbums() []Album {
 	rows, err := a.db.Query(`
@@ -1408,6 +1618,8 @@ func (a *App) AlbumCount(albumID int64) int {
 	return n
 }
 
+// ---------- умные альбомы ----------
+
 func (a *App) ListSmartAlbums() []SmartAlbum {
 	rows, err := a.db.Query(`SELECT id, name, filter FROM smart_albums ORDER BY id DESC`)
 	if err != nil {
@@ -1455,30 +1667,9 @@ func (a *App) SmartAlbumItems(filterJSON string, offset, limit int) []Media {
 	if err := jsonUnmarshal(filterJSON, &f); err != nil {
 		return []Media{}
 	}
-	conds := []string{"in_safe=0"}
-	args := []interface{}{}
-	if f.Favorite {
-		conds = append(conds, "favorite=1")
-	}
-	if f.MinRating > 0 {
-		conds = append(conds, "rating>=?")
-		args = append(args, f.MinRating)
-	}
-	if f.Type != "" {
-		conds = append(conds, "type=?")
-		args = append(args, f.Type)
-	}
-	if f.OnlyGPS {
-		conds = append(conds, "(lat!=0 OR lon!=0)")
-	}
-	if q := strings.TrimSpace(f.Q); q != "" {
-		lq := "%" + strings.ToLower(q) + "%"
-		conds = append(conds, "(name_lower LIKE ? OR path_lower LIKE ? OR LOWER(ocr_text) LIKE ?)")
-		args = append(args, lq, lq, lq)
-	}
-	where := strings.Join(conds, " AND ")
+	conds, args := buildSmartWhere(f)
 	args = append(args, limit, offset)
-	rows, err := a.db.Query(`SELECT `+mediaCols+` FROM media WHERE `+where+`
+	rows, err := a.db.Query(`SELECT `+mediaCols+` FROM media WHERE `+strings.Join(conds, " AND ")+`
 		ORDER BY taken_at DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return []Media{}
@@ -1492,6 +1683,13 @@ func (a *App) SmartAlbumCount(filterJSON string) int {
 	if err := jsonUnmarshal(filterJSON, &f); err != nil {
 		return 0
 	}
+	conds, args := buildSmartWhere(f)
+	var n int
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM media WHERE `+strings.Join(conds, " AND "), args...).Scan(&n)
+	return n
+}
+
+func buildSmartWhere(f smartFilter) ([]string, []interface{}) {
 	conds := []string{"in_safe=0"}
 	args := []interface{}{}
 	if f.Favorite {
@@ -1510,15 +1708,15 @@ func (a *App) SmartAlbumCount(filterJSON string) int {
 	}
 	if q := strings.TrimSpace(f.Q); q != "" {
 		lq := "%" + strings.ToLower(q) + "%"
-		conds = append(conds, "(name_lower LIKE ? OR path_lower LIKE ? OR LOWER(ocr_text) LIKE ?)")
+		conds = append(conds, "(name_lower LIKE ? OR path_lower LIKE ? OR LOWER(camera) LIKE ?)")
 		args = append(args, lq, lq, lq)
 	}
-	var n int
-	_ = a.db.QueryRow(`SELECT COUNT(*) FROM media WHERE `+strings.Join(conds, " AND "), args...).Scan(&n)
-	return n
+	return conds, args
 }
 
 func jsonUnmarshal(s string, v interface{}) error { return json.Unmarshal([]byte(s), v) }
+
+// ---------- сейф ----------
 
 type SafeInfo struct {
 	Exists   bool   `json:"exists"`
@@ -1584,8 +1782,6 @@ func (a *App) UnlockSafe(password string) bool {
 func (a *App) LockSafe()            { a.unlocked = false }
 func (a *App) IsSafeUnlocked() bool { return a.unlocked }
 
-// DeleteSafe удаляет сейф: снимает флаг in_safe со всех файлов и удаляет
-// защищённый альбом из БД. Сами файлы остаются на диске.
 func (a *App) DeleteSafe() error {
 	if !a.unlocked {
 		return fmt.Errorf("сейф заблокирован")
@@ -1664,8 +1860,8 @@ func (a *App) RemoveFromSafe(hash string) error {
 	return nil
 }
 
-// DeleteFiles отправляет файлы в корзину ОС (восстановимые), затем удаляет
-// записи из БД. Сами файлы остаются в корзине.
+// ---------- удаление файлов ----------
+
 func (a *App) DeleteFiles(hashes []string) error {
 	var paths []string
 	for _, h := range hashes {
@@ -1679,7 +1875,6 @@ func (a *App) DeleteFiles(hashes []string) error {
 
 	switch runtime.GOOS {
 	case "windows":
-		// Windows: Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile с опцией корзины.
 		var b strings.Builder
 		b.WriteString("Add-Type -AssemblyName Microsoft.VisualBasic\r\n")
 		b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
@@ -1694,12 +1889,11 @@ func (a *App) DeleteFiles(hashes []string) error {
 		defer os.Remove(tmp.Name())
 		_, _ = tmp.WriteString(b.String())
 		tmp.Close()
-		cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
+		cmd := hiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("powershell: %v — %s", err, string(out))
 		}
 	case "darwin":
-		// macOS: Finder delete через AppleScript.
 		var b strings.Builder
 		b.WriteString("tell application \"Finder\"\n")
 		for _, p := range paths {
@@ -1707,20 +1901,19 @@ func (a *App) DeleteFiles(hashes []string) error {
 			b.WriteString("\tdelete POSIX file \"" + esc + "\"\n")
 		}
 		b.WriteString("end tell\n")
-		cmd := exec.Command("osascript", "-e", b.String())
+		cmd := hiddenCmd("osascript", "-e", b.String())
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("osascript: %v — %s", err, string(out))
 		}
 	default:
-		// Linux: gio trash (GNOME/KDE) или trash-put.
 		args := append([]string{"trash"}, paths...)
 		if _, err := exec.LookPath("gio"); err == nil {
-			cmd := exec.Command("gio", args...)
+			cmd := hiddenCmd("gio", args...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("gio trash: %v — %s", err, string(out))
 			}
 		} else if _, err := exec.LookPath("trash-put"); err == nil {
-			cmd := exec.Command("trash-put", paths...)
+			cmd := hiddenCmd("trash-put", paths...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("trash-put: %v — %s", err, string(out))
 			}
@@ -1729,7 +1922,6 @@ func (a *App) DeleteFiles(hashes []string) error {
 		}
 	}
 
-	// удаляем записи из БД и превью
 	for _, h := range hashes {
 		_, _ = a.db.Exec(`DELETE FROM album_items WHERE media_hash = ?`, h)
 		_, _ = a.db.Exec(`DELETE FROM media WHERE hash = ?`, h)
@@ -1737,6 +1929,8 @@ func (a *App) DeleteFiles(hashes []string) error {
 	}
 	return nil
 }
+
+// ---------- дубликаты ----------
 
 type DuplicateGroup struct {
 	ContentHash string  `json:"contentHash"`
@@ -1770,21 +1964,7 @@ func (a *App) Duplicates() []DuplicateGroup {
 	return out
 }
 
-func (a *App) RunOCR(hash string) (string, error) {
-	m, ok := a.getByHash(hash)
-	if !ok {
-		return "", fmt.Errorf("not found")
-	}
-	if !a.hasTess {
-		return "", fmt.Errorf("tesseract не установлен")
-	}
-	if err := a.runOCRFor(m); err != nil {
-		return "", err
-	}
-	var txt string
-	_ = a.db.QueryRow(`SELECT ocr_text FROM media WHERE hash=?`, hash).Scan(&txt)
-	return txt, nil
-}
+// ---------- файловые операции ----------
 
 func (a *App) RevealInFileManager(hash string) error {
 	m, ok := a.getByHash(hash)
@@ -1794,11 +1974,11 @@ func (a *App) RevealInFileManager(hash string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("explorer", "/select,"+m.Path)
+		cmd = hiddenCmd("explorer", "/select,"+m.Path)
 	case "darwin":
-		cmd = exec.Command("open", "-R", m.Path)
+		cmd = hiddenCmd("open", "-R", m.Path)
 	default:
-		cmd = exec.Command("xdg-open", filepath.Dir(m.Path))
+		cmd = hiddenCmd("xdg-open", filepath.Dir(m.Path))
 	}
 	return cmd.Start()
 }
@@ -1814,11 +1994,11 @@ func (a *App) OpenFile(hash string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", m.Path)
+		cmd = hiddenCmd("cmd", "/c", "start", "", m.Path)
 	case "darwin":
-		cmd = exec.Command("open", m.Path)
+		cmd = hiddenCmd("open", m.Path)
 	default:
-		cmd = exec.Command("xdg-open", m.Path)
+		cmd = hiddenCmd("xdg-open", m.Path)
 	}
 	return cmd.Start()
 }
@@ -1862,7 +2042,7 @@ func (a *App) CopyFilesToClipboard(hashes []string) error {
 		b.WriteString("[System.Windows.Forms.Clipboard]::SetFileDropList($col)\r\n")
 		_, _ = tmp.WriteString(b.String())
 		tmp.Close()
-		cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
+		cmd := hiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
 		return cmd.Run()
 	case "darwin":
 		var parts []string
@@ -1870,17 +2050,17 @@ func (a *App) CopyFilesToClipboard(hashes []string) error {
 			parts = append(parts, `POSIX file "`+strings.ReplaceAll(p, `"`, `\"`)+`"`)
 		}
 		script := `set the clipboard to {` + strings.Join(parts, ", ") + `}`
-		cmd := exec.Command("osascript", "-e", script)
+		cmd := hiddenCmd("osascript", "-e", script)
 		return cmd.Run()
 	default:
 		uri := strings.Join(paths, "\n")
 		if _, err := exec.LookPath("wl-copy"); err == nil {
-			cmd := exec.Command("wl-copy")
+			cmd := hiddenCmd("wl-copy")
 			cmd.Stdin = strings.NewReader(uri)
 			return cmd.Run()
 		}
 		if _, err := exec.LookPath("xclip"); err == nil {
-			cmd := exec.Command("xclip", "-selection", "clipboard")
+			cmd := hiddenCmd("xclip", "-selection", "clipboard")
 			cmd.Stdin = strings.NewReader(uri)
 			return cmd.Run()
 		}
@@ -1893,21 +2073,21 @@ func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + 
 func writeClipboardText(text string) error {
 	switch runtime.GOOS {
 	case "windows":
-		cmd := exec.Command("cmd", "/c", "clip")
+		cmd := hiddenCmd("cmd", "/c", "clip")
 		cmd.Stdin = strings.NewReader(text)
 		return cmd.Run()
 	case "darwin":
-		cmd := exec.Command("pbcopy")
+		cmd := hiddenCmd("pbcopy")
 		cmd.Stdin = strings.NewReader(text)
 		return cmd.Run()
 	default:
 		if _, err := exec.LookPath("wl-copy"); err == nil {
-			cmd := exec.Command("wl-copy")
+			cmd := hiddenCmd("wl-copy")
 			cmd.Stdin = strings.NewReader(text)
 			return cmd.Run()
 		}
 		if _, err := exec.LookPath("xclip"); err == nil {
-			cmd := exec.Command("xclip", "-selection", "clipboard")
+			cmd := hiddenCmd("xclip", "-selection", "clipboard")
 			cmd.Stdin = strings.NewReader(text)
 			return cmd.Run()
 		}
