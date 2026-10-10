@@ -1,12 +1,11 @@
-# Wails build output (содержит .exe/.app и обвязку)
+# Wails build output
 build/
 frontend/dist/wailsjs/
 
-# БД и кэш превью (создаются в %APPDATA% и %LOCALAPPDATA%, но на случай кастомных путей)
+# БД и кэш
 *.db
 *.db-wal
 *.db-shm
-media-gallery/
 
 # Go
 *.exe
@@ -15,7 +14,7 @@ media-gallery/
 *.out
 vendor/
 
-# Node (на будущее, если появится сборщик)
+# Node
 node_modules/
 package-lock.json
 yarn.lock

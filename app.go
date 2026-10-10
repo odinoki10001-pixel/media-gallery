@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,12 @@ import (
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+// Version проставляется через -ldflags "-X main.Version=v0.3.0"
+// при сборке релиза. По умолчанию — "dev".
+var Version = "dev"
+
+const githubRepo = "odinoki10001-pixel/media-gallery"
 
 // ---------- типы ----------
 
@@ -82,6 +89,16 @@ type ScanProgress struct {
 	ThumbDone   int    `json:"thumbDone"`
 	DepsStatus  string `json:"depsStatus"`
 	DepsMessage string `json:"depsMessage"`
+}
+
+// UpdateInfo — информация о новой версии, которую отдаём на фронт.
+type UpdateInfo struct {
+	Available   bool   `json:"available"`
+	Version     string `json:"version"`
+	Current     string `json:"current"`
+	URL         string `json:"url"`
+	PublishedAt string `json:"publishedAt"`
+	Notes       string `json:"notes"`
 }
 
 // ---------- DepManager ----------
@@ -375,6 +392,9 @@ type App struct {
 	thumbDone atomic.Int64
 
 	thumbWake chan struct{}
+
+	// последнее известное обновление (для повторных запросов с фронта)
+	lastUpdate atomic.Value
 }
 
 func NewApp() *App {
@@ -382,6 +402,59 @@ func NewApp() *App {
 		pending:   map[string]struct{}{},
 		thumbWake: make(chan struct{}, 1),
 	}
+}
+
+// ---------- UTF-16LE для PowerShell -EncodedCommand ----------
+
+func utf16le(s string) []byte {
+	out := make([]byte, 0, len(s)*2)
+	for _, r := range s {
+		if r < 0x10000 {
+			out = append(out, byte(r), byte(r>>8))
+		} else {
+			r -= 0x10000
+			hi := 0xD800 + (r >> 10)
+			lo := 0xDC00 + (r & 0x3FF)
+			out = append(out, byte(hi), byte(hi>>8))
+			out = append(out, byte(lo), byte(lo>>8))
+		}
+	}
+	return out
+}
+
+func runPowerShellScript(script string) error {
+	enc := base64.StdEncoding.EncodeToString(utf16le(script))
+	cmd := hiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("powershell: %v — %s", err, string(out))
+	}
+	return nil
+}
+
+func runPowerShellFile(body string) error {
+	tmp, err := os.CreateTemp("", "mg-*.ps1")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	cmd := hiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("powershell: %v — %s", err, string(out))
+	}
+	return nil
 }
 
 // ---------- жизненный цикл ----------
@@ -435,9 +508,14 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 
+	a.lastUpdate.Store(UpdateInfo{})
+
 	a.depMgr = NewDepManager()
 	a.refreshToolFlags()
 	a.logToolFlags()
+
+	// Проверка обновлений — сразу и потом раз в сутки
+	go a.updatesLoop()
 
 	go func() {
 		time.Sleep(2 * time.Second)
@@ -447,16 +525,207 @@ func (a *App) startup(ctx context.Context) {
 		a.enqueueMissingThumbs()
 	}()
 
-	home, _ := os.UserHomeDir()
-	a.roots = []string{home}
+	a.roots = a.collectRoots()
+
 	if v := os.Getenv("MEDIA_GALLERY_DIRS"); v != "" {
 		a.roots = strings.Split(v, ",")
+	}
+
+	log.Println("scan roots:")
+	for _, r := range a.roots {
+		log.Println("  -", r)
 	}
 
 	go a.fullScan()
 	go a.startWatcher()
 	go a.thumbWorker()
 	go a.progressLoop()
+}
+
+// collectRoots возвращает список путей для сканирования.
+func (a *App) collectRoots() []string {
+	home, _ := os.UserHomeDir()
+	roots := []string{home}
+
+	if runtime.GOOS == "windows" {
+		homeVol := strings.ToUpper(filepath.VolumeName(home))
+		for _, letter := range "DEFGHIJKLMNOPQRSTUVWXYZ" {
+			vol := string(letter) + ":"
+			if strings.EqualFold(vol, homeVol) {
+				continue
+			}
+			p := vol + "\\"
+			if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+				roots = append(roots, p)
+			}
+		}
+	} else {
+		for _, mnt := range []string{"/media", "/mnt", "/Volumes"} {
+			entries, err := os.ReadDir(mnt)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+					roots = append(roots, filepath.Join(mnt, e.Name()))
+				}
+			}
+		}
+	}
+
+	return roots
+}
+
+// ---------- Обновления ----------
+
+// updatesLoop — первый чек через 5 секунд после старта, потом раз в 24 часа.
+func (a *App) updatesLoop() {
+	time.Sleep(5 * time.Second)
+	a.checkForUpdates()
+
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for range t.C {
+		a.checkForUpdates()
+	}
+}
+
+// checkForUpdates запрашивает последний релиз у GitHub и, если версия новее,
+// эмитит событие "update-available" на фронт.
+func (a *App) checkForUpdates() {
+	info, err := fetchLatestRelease()
+	if err != nil {
+		log.Printf("[updates] check failed: %v", err)
+		return
+	}
+	info.Current = Version
+
+	// Считаем "новее" только если текущая версия не dev и теги различаются.
+	if Version == "dev" || !isNewer(info.Version, Version) {
+		a.lastUpdate.Store(info)
+		return
+	}
+
+	info.Available = true
+	a.lastUpdate.Store(info)
+	log.Printf("[updates] available: %s (current %s)", info.Version, Version)
+
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "update-available", info)
+	}
+}
+
+// fetchLatestRelease делает запрос к GitHub API и разбирает ответ.
+func fetchLatestRelease() (UpdateInfo, error) {
+	var info UpdateInfo
+
+	req, err := http.NewRequest("GET",
+		"https://api.github.com/repos/"+githubRepo+"/releases/latest", nil)
+	if err != nil {
+		return info, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "media-gallery-updater")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return info, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return info, fmt.Errorf("HTTP %s", resp.Status)
+	}
+
+	var body struct {
+		TagName     string `json:"tag_name"`
+		HTMLURL     string `json:"html_url"`
+		PublishedAt string `json:"published_at"`
+		Body        string `json:"body"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return info, err
+	}
+
+	info.Version = body.TagName
+	info.URL = body.HTMLURL
+	info.PublishedAt = body.PublishedAt
+	info.Notes = body.Body
+	return info, nil
+}
+
+// isNewer сравнивает две semver-подобные версии: "v0.3.0" > "v0.2.0".
+// Префикс "v" игнорируется, отсутствующие части считаются нулями.
+func isNewer(a, b string) bool {
+	av := parseVersion(a)
+	bv := parseVersion(b)
+	for i := 0; i < 3; i++ {
+		if av[i] > bv[i] {
+			return true
+		}
+		if av[i] < bv[i] {
+			return false
+		}
+	}
+	return false
+}
+
+func parseVersion(s string) [3]int {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+	// отрезаем возможные суффиксы "-beta" и т.п.
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		s = s[:i]
+	}
+	parts := strings.Split(s, ".")
+	var out [3]int
+	for i := 0; i < 3 && i < len(parts); i++ {
+		n, _ := strconv.Atoi(parts[i])
+		out[i] = n
+	}
+	return out
+}
+
+// GetUpdateInfo возвращает текущее состояние проверки для фронта.
+func (a *App) GetUpdateInfo() UpdateInfo {
+	if v := a.lastUpdate.Load(); v != nil {
+		if u, ok := v.(UpdateInfo); ok {
+			u.Current = Version
+			return u
+		}
+	}
+	return UpdateInfo{Current: Version}
+}
+
+// CheckForUpdates — ручной чек (кнопка «Проверить обновления»).
+func (a *App) CheckForUpdates() UpdateInfo {
+	a.checkForUpdates()
+	return a.GetUpdateInfo()
+}
+
+// GetVersion возвращает строку версии текущего билда.
+func (a *App) GetVersion() string {
+	return Version
+}
+
+// OpenURL открывает ссылку в системном браузере.
+func (a *App) OpenURL(url string) error {
+	if url == "" {
+		return fmt.Errorf("пустой URL")
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return fmt.Errorf("разрешены только http/https")
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = hiddenCmd("cmd", "/c", "start", "", url)
+	case "darwin":
+		cmd = hiddenCmd("open", url)
+	default:
+		cmd = hiddenCmd("xdg-open", url)
+	}
+	return cmd.Start()
 }
 
 func (a *App) refreshToolFlags() {
@@ -589,7 +858,6 @@ func (a *App) initSchema() error {
 	_, _ = a.db.Exec(`UPDATE media SET name_lower = LOWER(name) WHERE name_lower = ''`)
 	_, _ = a.db.Exec(`UPDATE media SET path_lower = LOWER(path) WHERE path_lower = ''`)
 
-	// FTS5 по имени, пути, камере. OCR-колонка удалена.
 	_, _ = a.db.Exec(`
 		DROP TRIGGER IF EXISTS media_ai;
 		DROP TRIGGER IF EXISTS media_ad;
@@ -653,10 +921,13 @@ var videoExts = map[string]bool{
 
 var skipDirs = map[string]bool{
 	"node_modules": true, "AppData": true, "Windows": true,
-	"$Recycle.Bin": true, ".git": true, "Library": true,
-	"System": true, ".cache": true, "Program Files": true,
-	"Program Files (x86)": true, "ProgramData": true,
+	"$Recycle.Bin": true, "$RECYCLE.BIN": true, ".git": true,
+	"Library": true, "System": true, ".cache": true,
+	"Program Files": true, "Program Files (x86)": true, "ProgramData": true,
 	"Windows.old": true, ".thumbnails": true,
+	"System Volume Information": true, "Recovery": true,
+	"PerfLogs": true, "$WinREAgent": true,
+	"Users": true,
 }
 
 func classify(ext string) string {
@@ -818,6 +1089,7 @@ func (a *App) fullScan() {
 	a.thumbDone.Store(0)
 
 	for _, root := range a.roots {
+		log.Println("scanning:", root)
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
@@ -1882,16 +2154,8 @@ func (a *App) DeleteFiles(hashes []string) error {
 			b.WriteString("[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(" +
 				psQuote(p) + ", 'OnlyErrorDialogs', 'SendToRecycleBin')\r\n")
 		}
-		tmp, err := os.CreateTemp("", "mg-del-*.ps1")
-		if err != nil {
+		if err := runPowerShellFile(b.String()); err != nil {
 			return err
-		}
-		defer os.Remove(tmp.Name())
-		_, _ = tmp.WriteString(b.String())
-		tmp.Close()
-		cmd := hiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("powershell: %v — %s", err, string(out))
 		}
 	case "darwin":
 		var b strings.Builder
@@ -2028,11 +2292,6 @@ func (a *App) CopyFilesToClipboard(hashes []string) error {
 	}
 	switch runtime.GOOS {
 	case "windows":
-		tmp, err := os.CreateTemp("", "mg-clip-*.ps1")
-		if err != nil {
-			return err
-		}
-		defer os.Remove(tmp.Name())
 		var b strings.Builder
 		b.WriteString("Add-Type -AssemblyName System.Windows.Forms\r\n")
 		b.WriteString("$col = New-Object System.Collections.Specialized.StringCollection\r\n")
@@ -2040,10 +2299,7 @@ func (a *App) CopyFilesToClipboard(hashes []string) error {
 			b.WriteString("$col.Add(" + psQuote(p) + ") | Out-Null\r\n")
 		}
 		b.WriteString("[System.Windows.Forms.Clipboard]::SetFileDropList($col)\r\n")
-		_, _ = tmp.WriteString(b.String())
-		tmp.Close()
-		cmd := hiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.Name())
-		return cmd.Run()
+		return runPowerShellFile(b.String())
 	case "darwin":
 		var parts []string
 		for _, p := range paths {
@@ -2073,9 +2329,8 @@ func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + 
 func writeClipboardText(text string) error {
 	switch runtime.GOOS {
 	case "windows":
-		cmd := hiddenCmd("cmd", "/c", "clip")
-		cmd.Stdin = strings.NewReader(text)
-		return cmd.Run()
+		script := "Set-Clipboard -Value " + psQuote(text)
+		return runPowerShellScript(script)
 	case "darwin":
 		cmd := hiddenCmd("pbcopy")
 		cmd.Stdin = strings.NewReader(text)

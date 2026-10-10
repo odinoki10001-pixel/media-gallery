@@ -14,6 +14,8 @@ export function AlbumCount(arg1:number):Promise<number>;
 
 export function AlbumItems(arg1:number,arg2:number,arg3:number):Promise<Array<main.Media>>;
 
+export function CheckForUpdates():Promise<main.UpdateInfo>;
+
 export function CopyFilesToClipboard(arg1:Array<string>):Promise<void>;
 
 export function CopyPathsToClipboard(arg1:Array<string>):Promise<void>;
@@ -46,6 +48,10 @@ export function GetSectionItems(arg1:number,arg2:number,arg3:string,arg4:number,
 
 export function GetSections(arg1:string):Promise<Array<main.Section>>;
 
+export function GetUpdateInfo():Promise<main.UpdateInfo>;
+
+export function GetVersion():Promise<string>;
+
 export function IsSafeUnlocked():Promise<boolean>;
 
 export function ListAlbums():Promise<Array<main.Album>>;
@@ -55,6 +61,8 @@ export function ListSmartAlbums():Promise<Array<main.SmartAlbum>>;
 export function LockSafe():Promise<void>;
 
 export function OpenFile(arg1:string):Promise<void>;
+
+export function OpenURL(arg1:string):Promise<void>;
 
 export function RatedCount(arg1:number,arg2:string):Promise<number>;
 

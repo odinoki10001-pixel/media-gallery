@@ -58,7 +58,7 @@ function onProgress(p){
   host.innerHTML = lines.join('<br>');
 }
 
-// ---------- Модалки: делегирование ----------
+// ---------- Модалки ----------
 
 function setupModalDelegation(){
   const safeModal = $('safeModal');
@@ -490,13 +490,24 @@ function guessMime(ext){
   return 'application/octet-stream';
 }
 
+// viewportIO — подгружает превью при подходе к вьюпорту и выгружает при уходе.
+// img.complete && naturalWidth > 0 — на случай, если браузер отдал картинку из кэша
+// без повторного события load (иначе она бы навсегда осталась с opacity:0).
 const viewportIO = new IntersectionObserver((entries) => {
   for (const e of entries){
     const img = e.target.querySelector('img'); if (!img) continue;
     if (e.isIntersecting){
-      if (!img.src && img.dataset.src) img.src = img.dataset.src;
+      if (!img.src && img.dataset.src){
+        img.src = img.dataset.src;
+        if (img.complete && img.naturalWidth > 0){
+          img.classList.add('loaded');
+        }
+      }
     } else {
-      if (img.src){ img.removeAttribute('src'); img.classList.remove('loaded'); }
+      if (img.src){
+        img.removeAttribute('src');
+        img.classList.remove('loaded');
+      }
     }
   }
 }, { root: main, rootMargin: '3000px 0px' });
@@ -657,13 +668,16 @@ function removeHashesFromUI(hashes){
   }
 }
 
-// ---------- Rubber band ----------
+// ---------- Rubber band (переписан) ----------
+// Все координаты — в системе main (включая scroll). #rubber — ребёнок main,
+// absolute. Рамка не съезжает при скролле и не цепляет лишние карточки.
 
 function setupRubberBand(){
   const rb = document.createElement('div');
   rb.id = 'rubber';
-  main.parentElement.appendChild(rb);
-  let start = null;
+  main.appendChild(rb); // <-- именно main, не parentElement
+
+  let startX = null, startY = null;
   let baseSelection = null;
 
   main.addEventListener('mousedown', (e) => {
@@ -671,33 +685,44 @@ function setupRubberBand(){
     if (e.target.closest('.card')) return;
     if (e.target.closest('.sel-bar')) return;
     if (e.target.closest('.section-header')) return;
-    const mr = main.parentElement.getBoundingClientRect();
-    start = { x: e.clientX - mr.left + main.parentElement.scrollLeft,
-              y: e.clientY - mr.top + main.scrollTop };
+    if (e.target.closest('button')) return;
+
+    const rect = main.getBoundingClientRect();
+    // координаты относительно контента main (с учётом текущего скролла)
+    startX = e.clientX - rect.left + main.scrollLeft;
+    startY = e.clientY - rect.top + main.scrollTop;
+
     if (!e.ctrlKey && !e.metaKey) clearSelection();
     baseSelection = new Set(state.selected);
+
     rb.style.display = 'block';
-    rb.style.left = start.x + 'px';
-    rb.style.top = start.y + 'px';
+    rb.style.left = startX + 'px';
+    rb.style.top = startY + 'px';
     rb.style.width = '0px';
     rb.style.height = '0px';
     e.preventDefault();
   });
+
   main.addEventListener('mousemove', (e) => {
-    if (!start) return;
-    const mr = main.parentElement.getBoundingClientRect();
-    const x = e.clientX - mr.left + main.parentElement.scrollLeft;
-    const y = e.clientY - mr.top + main.scrollTop;
-    const x1 = Math.min(start.x, x), y1 = Math.min(start.y, y);
-    const x2 = Math.max(start.x, x), y2 = Math.max(start.y, y);
-    rb.style.left = x1 + 'px'; rb.style.top = y1 + 'px';
+    if (startX == null) return;
+    const rect = main.getBoundingClientRect();
+    const curX = e.clientX - rect.left + main.scrollLeft;
+    const curY = e.clientY - rect.top + main.scrollTop;
+
+    const x1 = Math.min(startX, curX), y1 = Math.min(startY, curY);
+    const x2 = Math.max(startX, curX), y2 = Math.max(startY, curY);
+
+    rb.style.left = x1 + 'px';
+    rb.style.top = y1 + 'px';
     rb.style.width = (x2 - x1) + 'px';
     rb.style.height = (y2 - y1) + 'px';
+
     updateRubberSelection(x1, y1, x2, y2, baseSelection);
   });
+
   window.addEventListener('mouseup', () => {
-    if (!start) return;
-    start = null;
+    if (startX == null) return;
+    startX = null; startY = null;
     baseSelection = null;
     rb.style.display = 'none';
     updateSelBar();
@@ -705,19 +730,21 @@ function setupRubberBand(){
 }
 
 function updateRubberSelection(x1, y1, x2, y2, baseSelection){
-  const mainRect = main.getBoundingClientRect();
+  state.selected = new Set(baseSelection);
+
+  const rect = main.getBoundingClientRect();
   const scrollTop = main.scrollTop;
   const scrollLeft = main.scrollLeft;
-
-  state.selected = new Set(baseSelection);
 
   document.querySelectorAll('.card').forEach(c => {
     const hash = c.dataset.hash;
     if (!hash) return;
     const r = c.getBoundingClientRect();
-    const cx1 = r.left - mainRect.left + scrollLeft;
-    const cy1 = r.top - mainRect.top + scrollTop;
+    // координаты карточки в системе main (как startX/startY)
+    const cx1 = r.left - rect.left + scrollLeft;
+    const cy1 = r.top - rect.top + scrollTop;
     const cx2 = cx1 + r.width, cy2 = cy1 + r.height;
+
     const hit = !(cx2 < x1 || cx1 > x2 || cy2 < y1 || cy1 > y2);
     if (hit) state.selected.add(hash);
   });
@@ -836,9 +863,11 @@ lbViewport.addEventListener('wheel', (e) => {
   }
 }, { passive: false });
 
+// Drag. Пропускаем клики по video (чтобы работали controls), по кнопкам и по img лайтбокса.
 lbViewport.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
   if (e.target.closest('button')) return;
+  if (e.target.tagName === 'VIDEO') return; // не начинаем drag на видео — иначе ломаются controls
   dragging = true;
   dragStart = { x: e.clientX - panX, y: e.clientY - panY };
 });
@@ -850,6 +879,7 @@ window.addEventListener('mousemove', (e) => {
 });
 window.addEventListener('mouseup', () => { dragging = false; });
 lbViewport.addEventListener('dblclick', (e) => {
+  if (e.target.tagName === 'VIDEO') return;
   e.preventDefault();
   if (zoom !== 1){ zoom = 1; panX = 0; panY = 0; applyTransform(true); }
   else setZoom(2.5, e.clientX, e.clientY);
@@ -1049,9 +1079,6 @@ function openSafeUnlock(info){
 }
 
 // ---------- Паттерн 3×3 ----------
-// Единственный источник истины — массив patPoints.
-// При любом изменении полностью перекрашиваем сетку и перерисовываем линии.
-// Это гарантирует, что подсвеченные точки и счётчик всегда синхронны.
 
 let patPoints = [];
 let patDragging = false;
@@ -1067,7 +1094,6 @@ function setupPattern(){
   patDragging = false;
   patLastPos = null;
 
-  // создаём точки
   grid.innerHTML = '';
   for (let i = 0; i < 9; i++){
     const d = document.createElement('div');
@@ -1085,14 +1111,11 @@ function setupPattern(){
   }
 
   function paint(){
-    // 1. подсветка — строго из массива
     grid.querySelectorAll('.pattern-dot').forEach(d => {
       const idx = Number(d.dataset.i);
       d.classList.toggle('on', patPoints.includes(idx));
     });
-    // 2. линии
     drawLines();
-    // 3. счётчик
     const st = $('patStatus');
     if (st) st.textContent = patPoints.length ? ('Точек: ' + patPoints.length) : 'Нарисуйте паттерн';
   }
@@ -1137,7 +1160,6 @@ function setupPattern(){
     const x = clientX - wr.left;
     const y = clientY - wr.top;
     if (patLastPos){
-      // интерполяция — иначе быстрые движения пропускают точки
       const dist = Math.hypot(x - patLastPos.x, y - patLastPos.y);
       const steps = Math.max(1, Math.ceil(dist / 4));
       for (let s = 1; s <= steps; s++){
@@ -1153,9 +1175,6 @@ function setupPattern(){
 
   wrap._getPattern = () => patPoints.join('-');
   wrap._resetPattern = () => { patPoints = []; patLastPos = null; paint(); };
-
-  // навешиваем один раз на этот конкретный wrap
-  wrap._patAttached = true;
 
   wrap.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -1269,3 +1288,58 @@ function toast(msg){
   const el = $('toast'); el.textContent = msg; el.classList.add('show');
   clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('show'), 2200);
 }
+// ---------- Проверка обновлений ----------
+
+(function initUpdates(){
+  const bar = document.getElementById('updateBar');
+  const verEl = document.getElementById('updateVersion');
+  const curEl = document.getElementById('updateCurrent');
+  const btnOpen = document.getElementById('updateOpen');
+  const btnSkip = document.getElementById('updateSkip');
+  const versionLine = document.getElementById('versionLine');
+
+  let currentInfo = null;
+
+  function show(info){
+    if (!info || !info.available) return;
+    currentInfo = info;
+    verEl.textContent = info.version || '';
+    curEl.textContent = 'У вас: ' + (info.current || 'dev');
+    bar.hidden = false;
+  }
+
+  function hide(){
+    bar.hidden = true;
+  }
+
+  btnSkip.addEventListener('click', hide);
+  btnOpen.addEventListener('click', async () => {
+    if (!currentInfo) return;
+    try {
+      await window.go.main.App.OpenURL(currentInfo.url);
+      hide();
+    } catch (e){
+      console.error('open url:', e);
+    }
+  });
+
+  // событие из Go
+  window.runtime.EventsOn('update-available', (info) => {
+    console.log('[updates] available:', info);
+    show(info);
+  });
+
+  // подстраховка: если событие пришло до подписки — запросим состояние
+  window.addEventListener('DOMContentLoaded', async () => {
+    try {
+      if (!window.go || !window.go.main) return;
+      const v = await window.go.main.App.GetVersion();
+      if (versionLine && v) versionLine.textContent = 'версия ' + v;
+
+      const info = await window.go.main.App.GetUpdateInfo();
+      if (info && info.available) show(info);
+    } catch (e){
+      // тихо игнорируем — приложение может работать без обновлений
+    }
+  });
+})();

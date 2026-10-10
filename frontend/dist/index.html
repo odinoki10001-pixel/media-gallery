@@ -27,6 +27,7 @@
   <button class="sb-add" id="btnAddSmart">+ Умный</button>
 
   <div class="scan-status" id="scanStatus"></div>
+  <div class="version-line" id="versionLine"></div>
 </aside>
 
 <div class="content">
@@ -128,6 +129,17 @@
       <button class="primary" id="smartCreate">Создать</button>
     </div>
   </div>
+</div>
+
+<!-- Плашка «доступно обновление» -->
+<div id="updateBar" class="update-bar glass" hidden>
+  <span class="update-ico">⬆</span>
+  <div class="update-text">
+    <div class="update-title">Доступна новая версия <b id="updateVersion">—</b></div>
+    <div class="update-sub" id="updateCurrent"></div>
+  </div>
+  <button class="act" id="updateSkip">Позже</button>
+  <button class="act primary" id="updateOpen">Открыть релиз</button>
 </div>
 
 <div id="toast" class="toast"></div>

@@ -93,7 +93,6 @@ Windows Explorer, macOS Finder и «Проводник» показывают файлы. Они не показывают
 ```
 ? ffmpeg найден
 ? ImageMagick найден
-? tesseract найден
 ```
 
 ## Установка и запуск

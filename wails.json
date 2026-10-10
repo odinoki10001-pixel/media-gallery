@@ -2,5 +2,13 @@
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "media-gallery",
   "outputfilename": "media-gallery",
-  "author": { "name": "You" }
+  "info": {
+    "companyName": "media-gallery",
+    "productName": "Галерея",
+    "productVersion": "0.3.0",
+    "copyright": "MIT"
+  },
+  "author": {
+    "name": "odinoki10001-pixel"
+  }
 }

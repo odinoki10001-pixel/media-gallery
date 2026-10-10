@@ -26,6 +26,10 @@ export function AlbumItems(arg1, arg2, arg3) {
   return window['go']['main']['App']['AlbumItems'](arg1, arg2, arg3);
 }
 
+export function CheckForUpdates() {
+  return window['go']['main']['App']['CheckForUpdates']();
+}
+
 export function CopyFilesToClipboard(arg1) {
   return window['go']['main']['App']['CopyFilesToClipboard'](arg1);
 }
@@ -90,6 +94,14 @@ export function GetSections(arg1) {
   return window['go']['main']['App']['GetSections'](arg1);
 }
 
+export function GetUpdateInfo() {
+  return window['go']['main']['App']['GetUpdateInfo']();
+}
+
+export function GetVersion() {
+  return window['go']['main']['App']['GetVersion']();
+}
+
 export function IsSafeUnlocked() {
   return window['go']['main']['App']['IsSafeUnlocked']();
 }
@@ -108,6 +120,10 @@ export function LockSafe() {
 
 export function OpenFile(arg1) {
   return window['go']['main']['App']['OpenFile'](arg1);
+}
+
+export function OpenURL(arg1) {
+  return window['go']['main']['App']['OpenURL'](arg1);
 }
 
 export function RatedCount(arg1, arg2) {
